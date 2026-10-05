@@ -128,6 +128,9 @@ function loadApp(search = "") {
     "ckpt-truncate",
     "timeline",
     "timeline-list",
+    "compensate-seq",
+    "compensate-btn",
+    "error-timeline",
     "script",
     "script-input",
     "script-load",
@@ -293,6 +296,7 @@ function statusBody(expId, opts = {}) {
     a: side(opts.aRead, opts.aLog, opts.aTx, opts.aRo),
     b: side(opts.bRead, opts.bLog, opts.bTx, opts.bRo),
     checkpoint: { last: opts.ckptLast || null, log: opts.ckptLog || [] },
+    timeline: opts.timeline === undefined ? [] : opts.timeline,
     script: opts.script === undefined ? null : opts.script,
   };
 }

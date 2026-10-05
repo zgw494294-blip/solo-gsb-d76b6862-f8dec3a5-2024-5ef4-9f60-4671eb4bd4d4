@@ -122,6 +122,16 @@
        失败加法不计入；回滚、失败提交与纯读事务不记录；未提交内容不可见；
        提交重试成功只记一次。记录来自事务执行期间的内存捕获，查询与轮询不在
        两栏连接上额外读值、不提前建立快照；时间线只保存在内存，无需跨重启保留。</p>
+    <div class="controls">
+      <span class="add-group">
+        <input type="text" inputmode="numeric" pattern="[0-9]+" id="compensate-seq"
+               aria-label="要补偿的时间线序号" placeholder="末条序号" autocomplete="off">
+        <button type="button" id="compensate-btn">补偿该提交</button>
+      </span>
+      <span class="timeline-comp-hint">已提交的加法不能用 ROLLBACK 撤回：补偿用独立连接
+        真实提交，把值恢复为原记录 before，并追加一条系统补偿记录（不可再补偿）。</span>
+    </div>
+    <div class="error-box" id="error-timeline" hidden></div>
     <ol class="log timeline-log" id="timeline-list"></ol>
   </section>
 

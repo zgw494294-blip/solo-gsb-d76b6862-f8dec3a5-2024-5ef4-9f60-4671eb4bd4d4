@@ -79,6 +79,24 @@ in_transaction，与手工 BEGIN 严格互斥：手工 BEGIN 先成功则装载 
 脚本 ID 与当前不符（旧脚本的过期请求，包括已被新脚本替换后）、脚本
 已结束 / 取消、步号与当前步不一致，一律 409，不执行、不产生记录、
 不影响新脚本。
+
+已提交的加法不能用 ROLLBACK 撤回，时间线旁提供补偿操作（POST
+/api/experiments/<id>/compensate，body 为正整数 {"seq": N}，类型不符
+400）：仅能补偿时间线**末条普通提交**——时间线为空、seq 不是末条
+（过期目标）、末条本身是补偿记录（补偿记录不可再补偿）或脚本有效，
+一律 409。补偿用一条全新的独立连接真实提交（单条 UPDATE 即自动提交
+事务，busy_timeout=0），把值恢复为原记录的 before：两栏的事务、只读
+模式、最近一次显式读值与读快照都不受影响，已有读快照仍见旧值，全程
+不在两栏连接上额外读值。原记录保留；成功后按提交顺序追加一条
+side=system 的补偿记录：seq 顺延、before/after 为原记录的
+after/before、deltas 为原记录增量的逆序取负、另带 compensates 原
+seq；普通记录字段不变。核对目标与追加记录都在 timeline_lock 内完成
+（与普通提交的「COMMIT → 追加」同一临界区）：与普通提交交错时目标被
+重新核对，同一 seq 并发最多成功一次。写锁冲突（某栏持有未提交写入）
+立即返回 SQLite 错误名 / 码（200 + ok:false），失败不改库也不改
+时间线。补偿与手工操作共用同一套脚本准入：script_lock 内「复查 +
+在途计数」，装载会等待在途补偿收尾后才激活脚本，补偿绝不在脚本
+有效期执行；删除准入（410）与其余接口一致。
 """
 
 import os
@@ -230,6 +248,9 @@ class Experiment:
         # 另一栏新的手工请求在此期间也不被阻塞。
         self.manual_cond = threading.Condition(self.script_lock)
         self.manual_active = {"a": 0, "b": 0}
+        # 在途补偿请求计数：与手工操作同一套「复查 + 在途计数」准入，
+        # 装载等待它归零后才激活脚本，补偿绝不在脚本有效期执行
+        self.compensate_active = 0
         self.script = None  # None 或 {id, steps, cursor, records, status}
 
     def _init_db(self):
@@ -324,6 +345,78 @@ class Experiment:
         with self.timeline_lock:
             return [dict(record) for record in self.timeline]
 
+    def compensate(self, seq):
+        """补偿时间线末条普通提交：独立连接真实提交，把值恢复为原记录 before。
+
+        核对目标与追加记录都在 timeline_lock 内完成（与普通提交的
+        「COMMIT → 追加」同一临界区）：与普通提交交错时目标被重新核对，
+        同一 seq 并发最多成功一次。时间线为空、seq 不是末条（过期目标）、
+        末条本身是补偿记录（补偿记录不可再补偿）一律拒绝（HTTP 409）。
+        写锁冲突（某栏持有未提交写入）立即返回 SQLite 错误名 / 码，
+        不改库也不改时间线。全程不触碰两栏连接与 observer：两栏事务、
+        只读模式、最近一次显式读值与读快照都不受影响，已有读快照仍见
+        旧值，也不在两栏连接上额外读值。
+        """
+        with self.timeline_lock:
+            if not self.timeline:
+                return None, {"error": "timeline is empty; nothing to compensate"}
+            target = self.timeline[-1]
+            if target["seq"] != seq:
+                return None, {
+                    "error": "stale target: only the last record (seq %d) "
+                    "can be compensated" % target["seq"]
+                }
+            if target["side"] == "system":
+                return None, {
+                    "error": "record seq %d is itself a compensation; "
+                    "compensation records cannot be compensated" % seq
+                }
+            # 恢复目标与补偿增量取自原记录（json_int 无损编码，十进制
+            # 字符串同样解析回整数），不在任何连接上读值
+            restore_to = parse_int(target["before"])
+            undo_deltas = [
+                -parse_int(delta) for delta in reversed(target["deltas"])
+            ]
+            # 独立连接真实提交：单条 UPDATE 即一个自动提交事务；
+            # busy_timeout=0，写锁被占立即 SQLITE_BUSY，绝不等待。
+            # 该连接不是最后一个连接，关闭时不会触发默认检查点。
+            comp_conn = sqlite3.connect(
+                self.db_path, timeout=0, isolation_level=None
+            )
+            try:
+                comp_conn.execute("PRAGMA busy_timeout=0")
+                comp_conn.execute(
+                    "UPDATE kv SET val = ? WHERE id = 1", (restore_to,)
+                )
+            except sqlite3.Error as exc:
+                name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+                code = getattr(exc, "sqlite_errorcode", None)
+                return {
+                    "ok": False,
+                    "error": {"name": name, "code": code, "message": str(exc)},
+                    "timeline": [dict(record) for record in self.timeline],
+                }, None
+            finally:
+                comp_conn.close()
+            # 原记录保留；补偿记录按提交顺序追加：before/after 为原记录的
+            # after/before，deltas 为原增量的逆序取负，另带 compensates
+            # 原 seq；普通记录字段不变
+            record = {
+                "seq": len(self.timeline) + 1,
+                "side": "system",
+                "before": target["after"],
+                "after": target["before"],
+                "deltas": [json_int(delta) for delta in undo_deltas],
+                "compensates": target["seq"],
+            }
+            self.timeline.append(record)
+            return {
+                "ok": True,
+                "error": None,
+                "record": dict(record),
+                "timeline": [dict(item) for item in self.timeline],
+            }, None
+
     @staticmethod
     def validate_steps(raw):
         """整份校验脚本：必须是 1～50 步的 JSON 数组。
@@ -377,7 +470,8 @@ class Experiment:
                     return None, {
                         "error": "an active script already exists; cancel it first"
                     }
-                if not self.manual_active["a"] and not self.manual_active["b"]:
+                if not self.manual_active["a"] and not self.manual_active["b"] \
+                        and not self.compensate_active:
                     break
                 self.manual_cond.wait()
             with self.conn_locks["a"], self.conn_locks["b"]:
@@ -958,6 +1052,45 @@ def experiment_timeline(exp_id):
     try:
         # 只读内存中的提交时间线：不执行任何 SQL、不触碰两栏连接
         return jsonify({"timeline": exp.timeline_records()})
+    finally:
+        exp.finish_call()
+
+
+@app.post("/api/experiments/<exp_id>/compensate")
+def experiment_compensate(exp_id):
+    exp, response = admit_experiment(exp_id)
+    if exp is None:
+        return response
+    try:
+        data = request.get_json(silent=True)
+        seq = data.get("seq") if isinstance(data, dict) else None
+        # 正整数 seq（布尔不算整数）；类型不符一律 400
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+            return jsonify({"error": "seq must be a positive integer"}), 400
+        # 脚本有效期间拒绝补偿（409）。与手工操作同一套准入：「复查 +
+        # 在途计数」在同一段 script_lock 临界区内完成，装载会等待在途
+        # 补偿收尾后才激活脚本，补偿绝不在脚本有效期执行。锁内读标志
+        # 只能用不重复取锁的 _script_active_locked()。
+        with exp.script_lock:
+            if exp._script_active_locked():
+                return (
+                    jsonify(
+                        {"error": "compensation is locked while a script is active"}
+                    ),
+                    409,
+                )
+            exp.compensate_active += 1
+        try:
+            result, rejected = exp.compensate(seq)
+            if rejected is not None:
+                return jsonify(rejected), 409
+            return jsonify(result)
+        finally:
+            # 执行结束（含失败 / 异常）归还在途计数并唤醒等待中的装载；
+            # 准入名额由外层 finally 的 finish_call 归还
+            with exp.script_lock:
+                exp.compensate_active -= 1
+                exp.manual_cond.notify_all()
     finally:
         exp.finish_call()
 

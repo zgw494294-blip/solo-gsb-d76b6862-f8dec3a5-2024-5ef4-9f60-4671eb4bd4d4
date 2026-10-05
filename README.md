@@ -49,6 +49,23 @@
   两栏连接上额外读值、不提前建立快照，也不改变最近一次显式读值；`COMMIT`
   与记录追加在同一临界区完成，编号顺序与实际提交顺序严格一致；时间线只
   保存在内存，无需跨重启保留
+- **补偿末条提交**（时间线区块的序号输入框 + 按钮，或
+  `POST /api/experiments/<id>/compensate`，body 为正整数 `{"seq": N}`）：
+  已提交的加法不能用 `ROLLBACK` 撤回，补偿把值恢复为原记录的 `before`。
+  仅能补偿时间线**末条普通提交**——时间线为空、`seq` 不是末条（过期目标）、
+  末条本身是补偿记录（补偿记录不可再补偿）或脚本有效，一律 `409`；`seq`
+  类型不符（非正整数）`400`。补偿用一条**全新的独立连接**真实提交（单条
+  `UPDATE` 即自动提交事务，`busy_timeout=0`）：两栏的事务、只读模式、
+  最近一次显式读值与读快照都不受影响，**已有读快照仍见旧值**，全程不在
+  两栏连接上额外读值。原记录保留；成功后按提交顺序追加一条 `side=system`
+  的补偿记录：`seq` 顺延、`before`/`after` 为原记录的 `after`/`before`、
+  `deltas` 为原增量的**逆序取负**、另带 `compensates` 原序号；普通记录
+  字段不变。核对目标与追加记录都在 `timeline_lock` 内完成（与普通提交的
+  「COMMIT → 追加」同一临界区）：与普通提交交错时目标被重新核对，同一
+  `seq` 并发最多成功一次。写锁冲突（某栏持有未提交写入）立即返回
+  `200 + ok:false` 与 SQLite 错误名 / 码（如 `SQLITE_BUSY` / `5`），
+  失败不改库也不改时间线；脚本有效期间补偿 `409`，装载会等待在途补偿
+  收尾后才激活脚本；删除准入（`410`）与其余接口一致
 - 页面提供**删除当前实验**按钮（也可 HTTP 调用）：确认后删除。删除开始即等待
   此前已进入的请求正常完成，期间该实验的操作、状态、已提交值与检查点**新请求
   一律返回 410 Gone**；等待按实验独立，不阻塞其他实验。随后回滚两栏未提交事务、
@@ -419,6 +436,29 @@ BEGIN / 只读切换及时完成（两栏互换同理）、同栏请求仍串行
 
 ```bash
 python3 tests/backend_script.py
+```
+
+`tests/backend_compensate.py` 用同一个 stub 与最小路由分发驱动**实际路由**
+验证补偿操作：甲 100 +5 +7 提交后补偿 `seq=1`（已提交值恢复 100，追加系统
+记录 112→100、增量 [-7,-5]、`compensates=1`，原记录字段不变）、两栏事务 /
+只读模式 / 最近一次显式读值 / 读快照不受补偿影响（已有读快照仍见旧值）、
+过期目标与补偿记录不可再补偿（409）、非法 `seq`（400）、脚本有效期间 409、
+写锁冲突立即返回 `SQLITE_BUSY(5)` 且不改库 / 时间线、同一 `seq` 并发补偿
+最多成功一次、装载等待在途补偿收尾、大整数无损、删除准入（410）与未知
+ID（404）：
+
+```bash
+python3 tests/backend_compensate.py
+```
+
+`tests/compensate.test.js` 用同一个假浏览器环境覆盖补偿控件的前端行为：
+发送正整数 `seq`、成功渲染系统补偿记录并刷新已提交值、写锁冲突显示
+SQLite 错误名 / 码（时间线不变）、409 显示服务端说明并以服务端状态重核对、
+非法序号不发请求、新建进行中禁用、删除冻结、脚本有效期间禁用、旧实验
+迟到响应不影响新实验：
+
+```bash
+node tests/compensate.test.js
 ```
 
 ## 操作示例
@@ -841,6 +881,88 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/checkpoint/PASSIVE
 > 新脚本。非法请求体（缺少字符串 `script_id` 或整数 `step`）返回 **400**。
 > 装载时若任一栏仍有未提交事务（如上个脚本取消时留下的事务），先手工
 > `提交` / `回滚` 再装载，否则返回 **409**。
+
+### 示例八：补偿末条提交（系统补偿记录）
+
+> 已提交的加法不能用 `ROLLBACK` 撤回。时间线区块的补偿操作（序号输入框 +
+> 「补偿该提交」按钮，或 HTTP）把**末条普通提交**的值恢复为其 `before`：
+> 独立连接真实提交，两栏事务、只读模式、最近一次显式读值与读快照都不受影响，
+> **已有读快照仍见旧值**；成功后追加一条 `side=system` 的补偿记录
+> （`before`/`after` 对调、增量逆序取负、带 `compensates` 原序号），
+> 补偿记录不可再补偿。
+
+1. 甲：`BEGIN DEFERRED` → 输入 `5` → `加上` → 输入 `7` → `加上` → `提交`
+   （已提交值 **112**，时间线 **#1 甲（A） 100 → 112 增量 [5, 7]**）
+2. 乙：`BEGIN DEFERRED` → `读值` → 显示 **112**（乙的读快照建立）
+3. 时间线区块：序号输入 `1` → `补偿该提交` → 已提交值恢复 **100**，
+   时间线追加 **#2 系统（SYSTEM） 112 → 100 增量 [-7, -5]（补偿 #1）**，
+   原记录 #1 保留不变
+4. 乙：再次 `读值` → 仍为 **112**（乙的已有读快照不受补偿影响）；
+   乙 `回滚` 后再 `BEGIN DEFERRED` → `读值` → 显示 **100**
+5. 再点 `补偿该提交`（序号 `1` 或 `2`）→ **409**：#1 已不是末条（过期目标），
+   #2 是补偿记录（不可再补偿）
+
+#### HTTP 调用示例
+
+```bash
+EXP=<新建实验返回的 id>
+BASE=http://localhost:8000/api/experiments/$EXP
+
+# 甲：事务内 +5、+7 并提交（时间线 #1：100 → 112 [5, 7]）
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"begin"}'
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":5}'
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":7}'
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"commit"}'
+
+# 补偿末条普通提交（seq=1）：独立连接真实提交，值恢复为原记录 before
+curl -s -X POST $BASE/compensate -H 'Content-Type: application/json' \
+  -d '{"seq":1}'
+# {"ok":true,"error":null,
+#  "record":{"seq":2,"side":"system","before":112,"after":100,
+#            "deltas":[-7,-5],"compensates":1},
+#  "timeline":[{"seq":1,"side":"a","before":100,"after":112,"deltas":[5,7]},
+#              {"seq":2,"side":"system","before":112,"after":100,
+#               "deltas":[-7,-5],"compensates":1}]}
+
+curl -s $BASE/committed          # {"committed":100}
+
+# 过期目标 / 补偿记录 / 脚本有效：409；非法 seq：400
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/compensate \
+  -H 'Content-Type: application/json' -d '{"seq":1}'     # 409（#1 已不是末条）
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/compensate \
+  -H 'Content-Type: application/json' -d '{"seq":2}'     # 409（补偿记录不可再补偿）
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/compensate \
+  -H 'Content-Type: application/json' -d '{"seq":0}'     # 400（非正整数）
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/compensate \
+  -H 'Content-Type: application/json' -d '{"seq":"1"}'   # 400（字符串不算整数）
+```
+
+写锁冲突（某栏持有未提交写入）时补偿立即返回 `200 + ok:false` 与原始
+SQLite 错误名 / 码，库与时间线都不变；对方提交 / 回滚释放写锁后可重试：
+
+```bash
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"begin"}'
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":3}'        # 甲持写锁，未提交
+curl -s -X POST $BASE/compensate -H 'Content-Type: application/json' \
+  -d '{"seq":2}'
+# {"ok":false,"error":{"name":"SQLITE_BUSY","code":5,
+#   "message":"database is locked"},"timeline":[...]}
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"rollback"}'             # 释放写锁后可重试补偿
+```
+
+> 补偿记录同样遵守整数无损约定：超出 ±2⁵³−1 的 `before` / `after` / `deltas`
+> 以十进制字符串返回（如 `"9007199254741093"` / `"-9007199254740993"`）。
+> 补偿与手工操作共用同一套脚本准入：脚本有效期间补偿 `409`，装载会等待
+> 在途补偿收尾后才激活脚本；删除开始后补偿与其余接口一样返回 `410`。
+> 页面控件遵守：新建实验进行中禁用、删除后冻结、旧实验的迟到补偿响应
+> 不影响新实验；脚本有效期间补偿控件禁用。
 
 
 > 提示：一栏的请求未完成时，该栏按钮会被禁用，另一栏仍可正常操作；

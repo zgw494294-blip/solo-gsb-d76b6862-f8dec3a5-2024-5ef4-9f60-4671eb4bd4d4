@@ -29,6 +29,8 @@ const panelBusy = { a: false, b: false };
 let scriptState = null;
 // 脚本请求（装载 / 推进 / 跳过 / 取消）在途：禁用全部脚本控件并锁住两栏。
 let scriptBusy = false;
+// 补偿请求在途：禁用补偿控件（不影响两栏手工与脚本控件）。
+let compensateBusy = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -82,6 +84,7 @@ function freezeExperiment(reason) {
   $("script").classList.add("exp-frozen");
   scriptState = null;
   scriptBusy = false;
+  compensateBusy = false;
   syncPanelControls();
   syncScriptControls();
   const note = $("deleted-note");
@@ -120,6 +123,7 @@ async function createExperiment() {
   panelBusy.b = false;
   scriptState = null;
   scriptBusy = false;
+  compensateBusy = false;
   setBusy("a", true);
   setBusy("b", true);
   setCheckpointBusy(true);
@@ -203,6 +207,9 @@ async function createExperiment() {
   $("ckpt-result").classList.remove("busy");
   $("log-ckpt").innerHTML = "";
   $("timeline-list").innerHTML = "";
+  // 新实验时间线为空：清空补偿序号与错误，恢复补偿控件可用性
+  $("compensate-seq").value = "";
+  clearError("timeline");
   clearError("ckpt");
   clearError("exp");
   // 新实验无脚本：清空脚本区并恢复「装载」可用
@@ -373,7 +380,7 @@ function renderCheckpoint(state) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-const TIMELINE_SIDE_LABELS = { a: "甲（A）", b: "乙（B）" };
+const TIMELINE_SIDE_LABELS = { a: "甲（A）", b: "乙（B）", system: "系统（SYSTEM）" };
 
 function renderTimeline(records) {
   // 只渲染服务端内存中的提交时间线：轮询本身不读库、不触碰两栏连接
@@ -391,8 +398,14 @@ function renderTimeline(records) {
     const li = document.createElement("li");
     const side = TIMELINE_SIDE_LABELS[rec.side] || rec.side;
     const deltas = (rec.deltas || []).join(", ");
-    li.textContent =
+    let text =
       `#${rec.seq}  ${side}  ${rec.before} → ${rec.after}  增量 [${deltas}]`;
+    if (rec.compensates !== undefined && rec.compensates !== null) {
+      // 系统补偿记录：标注被补偿的原序号，不可再补偿
+      text += `（补偿 #${rec.compensates}）`;
+      li.classList.add("timeline-compensation");
+    }
+    li.textContent = text;
     listEl.appendChild(li);
   }
   listEl.scrollTop = listEl.scrollHeight;
@@ -531,6 +544,16 @@ function syncScriptControls() {
   $("script-advance").disabled = frozen || !active;
   $("script-skip").disabled = frozen || !active;
   $("script-cancel").disabled = frozen || !active;
+  syncCompensateControls();
+}
+
+function syncCompensateControls() {
+  // 补偿控件与脚本控件共用同一批锁定来源（创建中 / 冻结 / 脚本有效），
+  // 另加补偿请求自身的在途禁用；因此由 syncScriptControls 一并调用，
+  // 创建 / 冻结 / 脚本状态变化走过的每一处都会同步到这里。
+  const disabled = creating || expFrozen || compensateBusy || scriptActive();
+  $("compensate-seq").disabled = disabled;
+  $("compensate-btn").disabled = disabled;
 }
 
 function showError(side, error) {
@@ -804,6 +827,70 @@ async function handleScriptError(e, gen, prefix) {
   showError("script", { name: null, code: null, message: prefix + "请求失败：" + e.message });
 }
 
+async function doCompensate() {
+  if (creating || expFrozen) return;
+  // 脚本有效期间补偿被后端锁定（409）；前端直接不发请求
+  if (scriptActive()) return;
+  const raw = $("compensate-seq").value.trim();
+  // seq 为正整数（时间线序号规模有限，超出安全整数的一律视为非法输入）
+  if (!/^[0-9]+$/.test(raw)) {
+    showError("timeline", { name: null, code: null, message: "请输入正整数序号（时间线末条普通提交）" });
+    return;
+  }
+  const seq = Number(raw);
+  if (!Number.isSafeInteger(seq) || seq < 1) {
+    showError("timeline", { name: null, code: null, message: "请输入正整数序号（时间线末条普通提交）" });
+    return;
+  }
+  const gen = expGen;
+  compensateBusy = true;
+  syncCompensateControls();
+  clearError("timeline");
+  try {
+    // 与脚本动作共用的 410 / 404 / 409 处理：409 携带服务端说明
+    const data = await fetchScriptJson(`/api/experiments/${expId}/compensate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seq }),
+    });
+    if (gen !== expGen) return;
+    renderTimeline(data.timeline);
+    if (!data.ok && data.error) {
+      // 写锁冲突等 SQLite 错误：库与时间线均未变，错误名 / 码如实显示
+      showError("timeline", data.error);
+    }
+    refreshCommitted(gen, { allowAutoCreate: false }).catch(() => {});
+  } catch (e) {
+    if (e instanceof ExpDeleted) {
+      if (gen === expGen) {
+        freezeExperiment(`实验 ${expId} 已删除（410）：补偿未执行，旧实验操作已禁用，可点击「新建实验」继续。`);
+      }
+      return;
+    }
+    if (e instanceof ExpNotFound) {
+      if (gen === expGen && !expFrozen) {
+        await newExperiment();
+      }
+      return;
+    }
+    if (gen !== expGen || expFrozen) return;
+    if (e instanceof ScriptConflict) {
+      // 目标过期（末条已变 / 末条是补偿记录）或脚本有效：
+      // 本地不猜测，立即以服务端状态为准重新核对时间线
+      showError("timeline", { name: null, code: null, message: "补偿被拒绝：" + e.message });
+      refreshStatus(gen, { allowAutoCreate: false }).catch(() => {});
+      return;
+    }
+    showError("timeline", { name: null, code: null, message: "补偿请求失败：" + e.message });
+  } finally {
+    // 冻结 / 已切换到新实验后，迟到响应不得改动当前控件状态
+    if (gen === expGen && !expFrozen) {
+      compensateBusy = false;
+      syncCompensateControls();
+    }
+  }
+}
+
 function setCheckpointBusy(busy) {
   // 检查点请求进行中只禁用检查点按钮，甲、乙两栏照常可用
   $("ckpt-passive").disabled = busy;
@@ -919,6 +1006,9 @@ async function init() {
   });
   $("script-cancel").addEventListener("click", () => {
     doScriptAction("cancel").catch(() => {});
+  });
+  $("compensate-btn").addEventListener("click", () => {
+    doCompensate().catch(() => {});
   });
 
   const params = new URLSearchParams(location.search);

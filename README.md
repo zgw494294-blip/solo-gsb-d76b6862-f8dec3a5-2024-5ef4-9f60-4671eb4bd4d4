@@ -49,6 +49,19 @@
   两栏连接上额外读值、不提前建立快照，也不改变最近一次显式读值；`COMMIT`
   与记录追加在同一临界区完成，编号顺序与实际提交顺序严格一致；时间线只
   保存在内存，无需跨重启保留
+- **补偿末条提交**（时间线区块输入序号，或
+  `POST /api/experiments/<id>/timeline/compensate`，body 为正整数
+  `{"seq": N}`）：已提交的加法不能用 `ROLLBACK` 撤回，改为对时间线
+  **末条普通提交**执行补偿——后端用一条**全新的独立连接**真实提交，把值
+  恢复为该记录的 `before`，并按提交顺序追加一条 `side=system` 的补偿记录
+  （`before`/`after` 对调、增量**逆序取负**、`compensates` 记原 seq；
+  原记录保留，普通记录字段不变）。仅末条普通提交可补偿：**过期序号、
+  补偿记录或脚本有效期间返回 `409`**，补偿记录不可再补偿；`busy_timeout=0`，
+  两栏持写锁时立即返回 `SQLITE_BUSY` 错误名 / 错误码，**失败不改库也不改
+  时间线**；目标核对与记录追加和普通提交的「COMMIT → 追加」在同一临界区
+  互斥，交错时重新核对目标，**同一 seq 并发最多成功一次**。补偿不触碰两栏
+  长期连接与 observer：两栏事务、只读模式、最近显式读值与读快照都不受影响
+  （已有读快照仍见旧值），也不在两栏连接上额外读值；大整数沿用无损编码
 - 页面提供**删除当前实验**按钮（也可 HTTP 调用）：确认后删除。删除开始即等待
   此前已进入的请求正常完成，期间该实验的操作、状态、已提交值与检查点**新请求
   一律返回 410 Gone**；等待按实验独立，不阻塞其他实验。随后回滚两栏未提交事务、
@@ -419,6 +432,28 @@ BEGIN / 只读切换及时完成（两栏互换同理）、同栏请求仍串行
 
 ```bash
 python3 tests/backend_script.py
+```
+
+`tests/backend_compensate.py` 用同一个 stub 驱动实际路由，覆盖补偿末条提交：
+甲 100 +5 +7 提交后补偿 #1（值恢复 100，追加 `system` 记录 112→100、
+增量 [-7,-5]、`compensates=1`，原记录保留）、已有读快照仍见旧值、两栏事务 /
+只读模式 / 最近显式读值不变、过期目标 / 补偿记录 / 空时间线 / 有效脚本一律
+409、写锁冲突立即返回 `SQLITE_BUSY(5)` 且不改库与时间线、并发同一 seq 最多
+成功一次（20 轮）、与普通提交交错时重新核对目标且结果一致（20 轮）、大整数
+无损、非法 seq 一律 400、删除后 410 / 未知实验 404：
+
+```bash
+python3 tests/backend_compensate.py
+```
+
+`tests/compensate.test.js` 用假 `fetch` 环境覆盖补偿控件的前端行为：正整数
+序号校验（非法输入不发请求）、请求在途禁用、成功后渲染系统补偿记录并刷新
+已提交值、`SQLITE_BUSY` 如实显示、409 本地不猜测并立即以服务端状态重核对、
+新建进行中禁用、删除后冻结（点击不发请求）、旧实验迟到响应不影响新实验、
+410 冻结：
+
+```bash
+node tests/compensate.test.js
 ```
 
 ## 操作示例
@@ -841,6 +876,91 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/checkpoint/PASSIVE
 > 新脚本。非法请求体（缺少字符串 `script_id` 或整数 `step`）返回 **400**。
 > 装载时若任一栏仍有未提交事务（如上个脚本取消时留下的事务），先手工
 > `提交` / `回滚` 再装载，否则返回 **409**。
+
+### 示例八：补偿末条提交（已提交的加法不能用 ROLLBACK 撤回）
+
+> 对时间线**末条普通提交**执行补偿：系统用一条**独立连接**真实提交，把值恢复
+> 为该记录的 `before`，并追加一条 `side=system` 的补偿记录（`before`/`after`
+> 对调、增量逆序取负、`compensates` 记原 seq）；原记录保留。过期序号、补偿
+> 记录或脚本有效期间返回 `409`；两栏持写锁时立即返回 `SQLITE_BUSY`，失败不改
+> 库也不改时间线；两栏事务、只读模式、最近显式读值与读快照都不受影响。
+
+1. 甲：`BEGIN DEFERRED` → 输入 `5` → `加上` → 输入 `7` → `加上` → `提交`
+   （已提交值 **112**，时间线 **#1 甲（A） 100 → 112 增量 [5, 7]**）
+2. 乙：`BEGIN DEFERRED` → `读值` → 显示 **112**（乙的读快照建立，先不结束事务）
+3. 在时间线区块的序号框输入 `1` → 点击 **补偿该条提交**：
+   已提交值变为 **100**，时间线追加 **#2 系统 112 → 100 增量 [-7, -5] 补偿 #1**；
+   #1 原样保留
+4. 乙：再点 `读值` → 仍为 **112**（已有读快照仍见旧值；乙的事务、两栏只读模式
+   与最近显式读值都不受补偿影响）→ `回滚`
+5. 再对 #2 或 #1 补偿都返回 **409**（补偿记录不可再补偿，#1 已不是末条）；
+   甲重新提交一笔后，只能补偿新的末条
+
+#### HTTP 调用示例
+
+```bash
+EXP=<新建实验返回的 id>
+BASE=http://localhost:8000/api/experiments/$EXP
+
+# 甲：事务内 +5、+7 后提交（时间线 #1：100 → 112，增量 [5, 7]）
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"begin"}'
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":5}'
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":7}'
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"commit"}'
+
+# 补偿末条普通提交 #1：值恢复为 100，追加 #2（system，112→100，[-7,-5]）
+curl -s -X POST $BASE/timeline/compensate \
+  -H 'Content-Type: application/json' -d '{"seq":1}'
+# {"ok":true,"error":null,
+#  "record":{"seq":2,"side":"system","before":112,"after":100,
+#            "deltas":[-7,-5],"compensates":1},
+#  "timeline":[
+#    {"seq":1,"side":"a","before":100,"after":112,"deltas":[5,7]},
+#    {"seq":2,"side":"system","before":112,"after":100,
+#     "deltas":[-7,-5],"compensates":1}]}
+curl -s $BASE/committed                     # {"committed":100}
+
+# 补偿记录不可再补偿；#1 已成为过期目标：均 409
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/timeline/compensate \
+  -H 'Content-Type: application/json' -d '{"seq":2}'   # 409
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/timeline/compensate \
+  -H 'Content-Type: application/json' -d '{"seq":1}'   # 409
+
+# 非法 seq（非正整数、字符串、布尔、缺字段）：400
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/timeline/compensate \
+  -H 'Content-Type: application/json' -d '{"seq":0}'   # 400
+
+# 乙提交一笔新的末条（时间线 #3：100 → 103，增量 [3]）
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' \
+  -d '{"op":"begin"}'
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":3}'
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' \
+  -d '{"op":"commit"}'
+
+# 两栏持写锁时补偿：200 + ok:false，如实返回 SQLITE_BUSY(5)，库与时间线不变
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"begin"}'
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":9}'        # 甲持写锁（未提交）
+curl -s -X POST $BASE/timeline/compensate \
+  -H 'Content-Type: application/json' -d '{"seq":3}'
+# {"ok":false,"error":{"name":"SQLITE_BUSY","code":5,
+#   "message":"database is locked"},"timeline":[...]}   甲未提交，写锁被占
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"rollback"}'             # 甲释放写锁
+curl -s -X POST $BASE/timeline/compensate \
+  -H 'Content-Type: application/json' -d '{"seq":3}'   # 成功：值恢复 100
+curl -s $BASE/committed                     # {"committed":100}
+```
+
+> 补偿与普通提交并发交错时，后端在同一临界区重新核对目标：同一 seq 的并发
+> 补偿最多成功一次，后到者收到 `409`；脚本有效期间补偿同样返回 `409`。
+> 删除中的实验返回 `410`，未知实验返回 `404`（与其他接口一致）。
 
 
 > 提示：一栏的请求未完成时，该栏按钮会被禁用，另一栏仍可正常操作；

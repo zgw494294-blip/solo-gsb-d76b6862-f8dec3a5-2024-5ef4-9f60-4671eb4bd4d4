@@ -122,6 +122,20 @@
        失败加法不计入；回滚、失败提交与纯读事务不记录；未提交内容不可见；
        提交重试成功只记一次。记录来自事务执行期间的内存捕获，查询与轮询不在
        两栏连接上额外读值、不提前建立快照；时间线只保存在内存，无需跨重启保留。</p>
+    <p class="timeline-hint">已提交的加法不能用 ROLLBACK 撤回：输入末条普通提交的序号
+       可执行<b>补偿</b>——系统用一条独立连接真实提交，把值恢复为该记录的 before，
+       并追加一条<b>系统</b>补偿记录（before/after 对调、增量逆序取负、记录原 seq）；
+       原记录保留。仅末条普通提交可补偿：过期序号、补偿记录或脚本有效期间返回 409；
+       两栏持写锁时立即返回 SQLITE_BUSY，失败不改库也不改时间线；两栏事务、只读模式、
+       最近显式读值与读快照均不受影响（已有读快照仍见旧值）。</p>
+    <div class="controls">
+      <span class="add-group">
+        <input type="text" inputmode="numeric" pattern="[0-9]+" id="compensate-seq"
+          placeholder="记录序号" aria-label="要补偿的时间线记录序号" autocomplete="off">
+        <button type="button" id="compensate-btn">补偿该条提交</button>
+      </span>
+    </div>
+    <div class="error-box" id="error-timeline" hidden></div>
     <ol class="log timeline-log" id="timeline-list"></ol>
   </section>
 

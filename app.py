@@ -39,6 +39,20 @@ WAL 检查点（PASSIVE / TRUNCATE）不由甲、乙两栏的连接执行，而�
 与轮询（/status 的 timeline 字段）都只读内存，不在两栏连接上额外读值、
 不提前建立快照，也不改变最近一次显式读值；时间线无需跨重启保存。
 
+已提交的加法不能用 ROLLBACK 撤回，改为对时间线末条普通提交执行补偿
+（POST /api/experiments/<id>/timeline/compensate，body 为正整数
+{"seq": N}）。仅当末条记录是普通提交且 seq 与其一致时才执行：过期目标、
+补偿（system）记录或有效脚本一律 409，补偿记录不可再补偿。补偿用一条
+全新的独立连接真实提交（自动提交模式的单条 UPDATE），把值恢复为原记录
+的 before；busy_timeout=0，两栏任一事务持有写锁时立即返回 SQLITE_BUSY
+错误名 / 错误码，失败不改库也不改时间线。目标核对、UPDATE 与记录追加
+都在 timeline_lock 内完成，与普通提交的「COMMIT → 追加」互斥：交错时
+重新核对目标，同一 seq 并发最多成功一次。成功按提交顺序追加一条
+side=system 的记录：before/after 对调、deltas 逆序取负、compensates
+记原 seq；原记录保留，普通记录字段不变。全程不触碰两栏长期连接与
+observer：两栏事务、只读模式、最近显式读值与读快照都不受影响（已有读
+快照仍见旧值），也不在两栏连接上额外读值。
+
 删除实验（DELETE /api/experiments/<id>）先在内存门控上标记删除开始，
 并等待此前已进入的请求全部正常完成；删除开始后该实验的操作、状态、
 已提交值与检查点新请求一律返回 410。等待按实验独立，不阻塞其他实验。
@@ -137,6 +151,24 @@ def parse_int(raw):
     if isinstance(raw, str) and INT_PATTERN.fullmatch(raw.strip()):
         return int(raw.strip())
     return None
+
+
+def timeline_public_view(record):
+    """时间线记录的对外视图：整数无损编码（大整数用十进制字符串）。
+
+    普通记录字段固定为 seq / side / before / after / deltas；补偿记录
+    （side=system）额外携带 compensates（被补偿记录的原 seq）。
+    """
+    view = {
+        "seq": record["seq"],
+        "side": record["side"],
+        "before": json_int(record["before"]),
+        "after": json_int(record["after"]),
+        "deltas": [json_int(delta) for delta in record["deltas"]],
+    }
+    if record["side"] == "system":
+        view["compensates"] = record["compensates"]
+    return view
 
 
 class PanelState:
@@ -308,21 +340,27 @@ class Experiment:
         for _base, delta in tx_adds:
             after += delta
             deltas.append(delta)
+        # 内部保存原始整数（无损）；对外视图在 timeline_records /
+        # run_compensate 出口经 json_int 编码，普通记录字段不变。
         self.timeline.append(
             {
                 "seq": len(self.timeline) + 1,
                 "side": side,
-                "before": json_int(before),
-                "after": json_int(after),
-                "deltas": [json_int(delta) for delta in deltas],
+                "before": before,
+                "after": after,
+                "deltas": deltas,
             }
         )
+
+    def _timeline_view_locked(self):
+        # 时间线对外视图；调用方必须持有 timeline_lock
+        return [timeline_public_view(record) for record in self.timeline]
 
     def timeline_records(self):
         # 只读内存中的时间线：不执行任何 SQL、不触碰两栏连接与 observer，
         # 不提前建立快照，也不改变最近一次显式读值
         with self.timeline_lock:
-            return [dict(record) for record in self.timeline]
+            return self._timeline_view_locked()
 
     @staticmethod
     def validate_steps(raw):
@@ -853,6 +891,83 @@ def run_checkpoint(exp, mode):
     return {"ok": True, "error": None, "state": exp.checkpoint_state(), **result}
 
 
+def run_compensate(exp, seq):
+    """补偿时间线末条普通提交，把已提交值恢复为该记录的 before。
+
+    仅当末条记录是普通提交且 seq 与其一致时才执行；过期目标、补偿
+    （system）记录与有效脚本一律由调用方返回 409，补偿记录不可再补偿。
+    用一条全新的独立连接真实提交（自动提交模式的单条 UPDATE，
+    busy_timeout=0）：两栏任一事务持有写锁时立即返回 SQLITE_BUSY 的
+    错误名 / 错误码，失败不改库也不改时间线。目标核对、UPDATE 与记录
+    追加都在 timeline_lock 内完成，与普通提交的「COMMIT → 追加」互斥：
+    交错时重新核对目标，同一 seq 并发最多成功一次。全程不触碰两栏长期
+    连接与 observer：两栏事务、只读模式、最近显式读值与读快照都不受
+    影响（已有读快照仍见旧值），也不在两栏连接上额外读值。
+
+    返回 (result, conflict)：conflict 非 None 时调用方返回 409。
+    """
+    # 锁序与 advance_script 一致（script_lock → timeline_lock），绝不反向：
+    # advance_script 持 script_lock 经 run_op 的 COMMIT 进入 timeline_lock。
+    with exp.script_lock:
+        if exp._script_active_locked():
+            return None, {
+                "error": "an active script exists; "
+                "finish or cancel it before compensating"
+            }
+        with exp.timeline_lock:
+            target = exp.timeline[-1] if exp.timeline else None
+            if target is None or target["seq"] != seq:
+                return None, {
+                    "error": "stale target: only the last normal timeline "
+                    "record can be compensated"
+                }
+            if target["side"] == "system":
+                return None, {
+                    "error": "compensation records cannot be compensated"
+                }
+            # 独立连接真实提交：不用两栏长期连接与 observer，避免把补偿与
+            # 两栏事务、读快照绑定；busy_timeout=0 使写锁冲突立即报错。
+            comp_conn = sqlite3.connect(
+                exp.db_path, timeout=0, isolation_level=None
+            )
+            try:
+                comp_conn.execute("PRAGMA busy_timeout=0")
+                comp_conn.execute(
+                    "UPDATE kv SET val = ? WHERE id = 1", (target["before"],)
+                )
+            except sqlite3.Error as exc:
+                # 写锁冲突等：如实返回 SQLite 错误名 / 错误码；
+                # 语句未生效，库与时间线都保持原样
+                name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+                code = getattr(exc, "sqlite_errorcode", None)
+                return {
+                    "ok": False,
+                    "error": {"name": name, "code": code, "message": str(exc)},
+                    "timeline": exp._timeline_view_locked(),
+                }, None
+            finally:
+                comp_conn.close()
+            # 成功：按提交顺序追加补偿记录。before/after 对调（末条记录的
+            # after 即当前已提交值——值的一切变化都有记录，且本临界区与
+            # 普通提交互斥），deltas 逆序取负，compensates 记原 seq；
+            # 原记录保留，普通记录字段不变。
+            record = {
+                "seq": len(exp.timeline) + 1,
+                "side": "system",
+                "before": target["after"],
+                "after": target["before"],
+                "deltas": [-delta for delta in reversed(target["deltas"])],
+                "compensates": target["seq"],
+            }
+            exp.timeline.append(record)
+            return {
+                "ok": True,
+                "error": None,
+                "record": timeline_public_view(record),
+                "timeline": exp._timeline_view_locked(),
+            }, None
+
+
 # 实验注册表：仅保存在内存中，无需跨重启保留。
 # 删除后的对象不从这里摘除，而是以墓碑（deleted=True）保留：
 # 任何准入请求都返回 410，并供并发 DELETE 等待者等待收尾结束。
@@ -958,6 +1073,31 @@ def experiment_timeline(exp_id):
     try:
         # 只读内存中的提交时间线：不执行任何 SQL、不触碰两栏连接
         return jsonify({"timeline": exp.timeline_records()})
+    finally:
+        exp.finish_call()
+
+
+@app.post("/api/experiments/<exp_id>/timeline/compensate")
+def experiment_timeline_compensate(exp_id):
+    exp, response = admit_experiment(exp_id)
+    if exp is None:
+        return response
+    try:
+        data = request.get_json(silent=True)
+        # seq 必须是正整数（布尔不算整数；非 JSON body 同样拒绝）
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("seq"), int)
+            or isinstance(data.get("seq"), bool)
+            or data["seq"] < 1
+        ):
+            return jsonify({"error": "seq must be a positive integer"}), 400
+        # 过期目标 / 补偿记录 / 有效脚本：409；写锁冲突等 SQLite 错误：
+        # 200 + ok:false 并如实携带错误名 / 错误码，库与时间线不变
+        result, conflict = run_compensate(exp, data["seq"])
+        if conflict is not None:
+            return jsonify(conflict), 409
+        return jsonify(result)
     finally:
         exp.finish_call()
 

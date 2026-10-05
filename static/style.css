@@ -387,6 +387,14 @@ button.danger:hover:not(:disabled) {
   color: #8b95a5;
 }
 
+.timeline-log li.timeline-system {
+  color: #fbbf24;
+}
+
+#compensate-seq {
+  width: 110px;
+}
+
 footer {
   padding: 0 20px 16px;
   color: #6b7280;
